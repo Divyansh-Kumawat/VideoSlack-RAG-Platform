@@ -22,6 +22,7 @@ from typing import TypedDict
 
 
 import yt_dlp
+from yt_dlp.utils import DownloadError
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
@@ -36,7 +37,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ── Config from .env ──────────────────────────────────────────────────────────
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "small")
 WHISPER_TEMP_DIR   = Path(os.getenv("WHISPER_TEMP_DIR", "./tmp_audio"))
 WHISPER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -236,8 +237,13 @@ def get_instagram_transcript(url: str) -> TranscriptResult:
             fp16=False,                          # fp16=False for CPU safety; set True on GPU
         )
 
-        raw_text: str = result.get("text", "")
-        language_code: str = result.get("language", "unknown")
+        raw_text: str = str(result.get("text", ""))
+        # Whisper may return a language as a string or a list; normalize to str
+        _language_raw = result.get("language", "unknown")
+        if isinstance(_language_raw, list):
+            language_code: str = _language_raw[0] if _language_raw else "unknown"
+        else:
+            language_code: str = str(_language_raw)
 
         clean_text = _clean_transcript_text(raw_text)
 
@@ -253,7 +259,7 @@ def get_instagram_transcript(url: str) -> TranscriptResult:
         )
         return TranscriptResult(text=clean_text, language=language_code)
 
-    except yt_dlp.utils.DownloadError as e:
+    except DownloadError as e:
         raise RuntimeError(
             f"yt-dlp failed to download the Instagram Reel: {e}. "
             "The reel may be private, deleted, or geo-restricted."
@@ -306,7 +312,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
     # Quick smoke test with a known public video
-    TEST_YT_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    TEST_YT_URL = "https://youtu.be/T-D1OfcDW1M"
 
     print("\n── YouTube transcript test ──")
     try:

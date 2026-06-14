@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 import instaloader
+from instaloader.instaloader import Instaloader
+from instaloader.structures import Post, Profile
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from dotenv import load_dotenv

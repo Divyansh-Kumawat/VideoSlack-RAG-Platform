@@ -54,20 +54,29 @@ class TranscriptChunk:
 # ─────────────────────────────────────────────────────────────────────────────
 # ChromaDB client — singleton
 # ─────────────────────────────────────────────────────────────────────────────
+from chromadb.api import ClientAPI
 
-_chroma_client: chromadb.PersistentClient | None = None
+_chroma_client: ClientAPI | None = None
+_chroma_client = chromadb.PersistentClient(path="./chroma_db")
 _vectorstore:   Chroma | None = None
 
 
-def _get_client() -> chromadb.PersistentClient:
+def _get_client() -> ClientAPI:
     global _chroma_client
+
     if _chroma_client is None:
         os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+
         _chroma_client = chromadb.PersistentClient(
             path=CHROMA_PERSIST_DIR,
             settings=Settings(anonymized_telemetry=False),
         )
-        logger.info("ChromaDB client initialised at %s", CHROMA_PERSIST_DIR)
+
+        logger.info(
+            "ChromaDB client initialised at %s",
+            CHROMA_PERSIST_DIR,
+        )
+
     return _chroma_client
 
 
