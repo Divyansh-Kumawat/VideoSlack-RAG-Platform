@@ -1,369 +1,326 @@
 # backend/core/rag_chain.py
 # ─────────────────────────────────────────────────────────────────────────────
-# RAG chain — ConversationalRetrievalChain + streaming + source citation.
+# RAG pipeline — retrieval + prompt assembly + streamed Mistral answer.
 #
-# Architecture:
-#   1. Rebuild ConversationBufferMemory from client-sent history (stateless backend)
-#   2. Retrieve top-k chunks from ChromaDB (filtered or cross-video)
-#   3. Stream Mistral tokens via SSE
-#   4. Collect source chunks and emit them as a final SSE event
+# Per chat turn:
+#   1. Decide which video(s) to search (explicit filter or inferred from text)
+#   2. Retrieve top-k transcript chunks from ChromaDB (balanced across A & B)
+#   3. Build ONE prompt: instructions + both videos' stats + excerpts + history
+#   4. Stream Mistral tokens; emit cited source chunks at the end
+#
+# Exactly one LLM call per question (no separate "condense question" call) —
+# free Mistral tiers allow very few requests per minute.
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
 
-import os
+import asyncio
 import json
 import logging
-from typing import AsyncGenerator, Any, Sequence
+import re
+from typing import Any, AsyncGenerator, Optional
 
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.callbacks.base import BaseCallbackHandler
-from langchain_mistralai import ChatMistralAI
-from langchain_core.messages import HumanMessage, AIMessage
+import httpx
 from langchain_core.documents import Document
-from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
-from backend.core.vector_store import get_retriever
-from backend.models.schemas import ChatTurn, SourceChunk, VideoID
-
-load_dotenv()
+from backend import config
+from backend.core import vector_store, video_store
+from backend.core.engagement import compare_engagement
+from backend.models.schemas import (
+    ChatTurn,
+    SourceChunk,
+    VideoID,
+    VideoMetadata,
+    format_timestamp,
+)
 
 logger = logging.getLogger(__name__)
 
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
-MISTRAL_MODEL   = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
-RETRIEVER_TOP_K = int(os.getenv("RETRIEVER_TOP_K", 6))
-MEMORY_MAX_TURNS = int(os.getenv("MEMORY_MAX_TURNS", 10))
+RATE_LIMIT_BACKOFF = [12, 30]   # seconds to wait before each retry on HTTP 429
 
-# ─────────────────────────────────────────────────────────────────────────────
-# System prompt injected before every answer
-# ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are VideoIQ, an expert social media analyst assistant.
-You have access to transcripts and metadata from two videos:
-- Video A: a YouTube video
-- Video B: an Instagram Reel
-
-Use ONLY the retrieved context to answer. Never hallucinate statistics.
-When citing engagement rates, hooks, or creator details — state which video
-(A or B) the information comes from.
-
-If asked to compare the two videos, structure your answer clearly:
-  Video A: ...
-  Video B: ...
-  Conclusion: ...
-
-Be concise, specific, and actionable. Creators want insights they can act on.
-"""
+class LLMError(RuntimeError):
+    """An LLM failure with a message that is safe to show to the user."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Streaming callback handler
+# Which video is the question about?
 # ─────────────────────────────────────────────────────────────────────────────
 
-class StreamingCallbackHandler(BaseCallbackHandler):
+_A_PATTERNS = re.compile(r"\b(video\s*a|video\s*1|first\s+video|1st\s+video)\b", re.I)
+_B_PATTERNS = re.compile(r"\b(video\s*b|video\s*2|second\s+video|2nd\s+video)\b", re.I)
+
+
+def detect_video_filter(question: str) -> Optional[str]:
     """
-    Collects streamed tokens into a queue-like list.
-    The async generator in build_rag_stream() reads from this.
+    "A" if the question mentions only Video A, "B" if only Video B,
+    otherwise None (search both — default for comparisons).
     """
-
-    def __init__(self) -> None:
-        self.tokens: list[str] = []
-        self.source_documents: list[Document] = []
-        self.done: bool = False
-
-    def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
-        self.tokens.append(token)
-
-    from typing import Sequence, Any
-
-def on_retriever_end(self, documents: Sequence[Document], **kwargs: Any) -> None:
-    """Captures retrieved docs the moment retrieval finishes."""
-    self.source_documents = list(documents)
-    logger.debug("Retriever returned %d documents", len(documents))
-
-    def on_llm_end(self, *args: Any, **kwargs: Any) -> None:
-        self.done = True
-
-    def on_chain_end(self, *args: Any, **kwargs: Any) -> None:
-        self.done = True
+    a = bool(_A_PATTERNS.search(question))
+    b = bool(_B_PATTERNS.search(question))
+    if a and not b:
+        return "A"
+    if b and not a:
+        return "B"
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Memory reconstruction (stateless backend)
+# Retrieval
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_memory(history: list[ChatTurn]) -> ConversationBufferMemory:
+# Words that usually point back at the previous turn ("why did it work?", "what about them?").
+_FOLLOW_UP_RE = re.compile(r"^(why|how come|and|but|so|what about)\b|\b(it|its|that|they|them|he|she)\b", re.I)
+
+
+def build_retrieval_query(question: str, history: list[ChatTurn]) -> str:
     """
-    Reconstructs LangChain ConversationBufferMemory from client-sent history.
-
-    The backend is fully stateless — no Redis, no server sessions.
-    The client sends the full conversation history on every request,
-    and we rebuild memory from scratch each turn.
-
-    Truncates to the last MEMORY_MAX_TURNS turns to avoid context overflow.
+    Follow-ups like "why is that?" retrieve poorly on their own, so short
+    or pronoun-heavy questions are combined with the previous user question.
     """
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer",
-    )
-
-    # Truncate to last N turns
-    recent = history[-(MEMORY_MAX_TURNS * 2):]
-
-    for turn in recent:
-        if turn.role == "user":
-            memory.chat_memory.add_message(HumanMessage(content=turn.content))
-        elif turn.role == "assistant":
-            memory.chat_memory.add_message(AIMessage(content=turn.content))
-
-    return memory
+    prev = next((t.content for t in reversed(history) if t.role == "user"), None)
+    if prev and (len(question.split()) <= 8 or _FOLLOW_UP_RE.search(question)):
+        return f"{prev}\n{question}"
+    return question
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Source chunk extraction
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _docs_to_source_chunks(docs: list[Document]) -> list[SourceChunk]:
-    """
-    Converts LangChain Documents into SourceChunk schema objects.
-    Deduplicates by (video_id, chunk_index).
-    """
+def to_source_chunks(results: list[tuple[Document, float]]) -> list[SourceChunk]:
     seen: set[tuple[str, int]] = set()
     sources: list[SourceChunk] = []
-
-    for doc in docs:
-        meta = doc.metadata or {}
-        vid  = meta.get("video_id", "A")
-        cidx = int(meta.get("chunk_index", 0))
-        key  = (vid, cidx)
-
-        if key in seen:
+    for doc, score in results:
+        m = doc.metadata or {}
+        vid = str(m.get("video_id", "A"))
+        idx = int(m.get("chunk_index", 0))
+        if (vid, idx) in seen or vid not in ("A", "B"):
             continue
-        seen.add(key)
+        seen.add((vid, idx))
 
-        sources.append(
-            SourceChunk(
-                video_id=VideoID(vid),
-                chunk_index=cidx,
-                text=doc.page_content,
-                start_char=int(meta.get("start_char", 0)),
-                score=meta.get("score"),
-                creator=meta.get("creator"),
-            )
-        )
+        start_s = m.get("start_seconds")
+        start_s = None if start_s is None or float(start_s) < 0 else float(start_s)
+        yt_id = m.get("youtube_id")
+        link = None
+        if yt_id:
+            link = f"https://www.youtube.com/watch?v={yt_id}"
+            if start_s is not None:
+                link += f"&t={int(start_s)}s"
 
+        sources.append(SourceChunk(
+            video_id=VideoID(vid),
+            chunk_index=idx,
+            text=doc.page_content,
+            start_char=int(m.get("start_char", 0)),
+            start_seconds=start_s,
+            timestamp=format_timestamp(start_s) if start_s is not None else None,
+            url=link,
+            title=m.get("title"),
+            creator=m.get("creator"),
+            score=score,
+        ))
     return sources
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build the LangChain chain
+# Prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_chain(
-    memory: ConversationBufferMemory,
-    callback_handler: StreamingCallbackHandler,
-    video_id_filter: str | None = None,
-) -> ConversationalRetrievalChain:
-    """
-    Assembles ConversationalRetrievalChain with:
-    - Mistral streaming LLM
-    - ChromaDB retriever (optionally filtered)
-    - Buffer memory
-    - Custom streaming callback
-    """
-    if not MISTRAL_API_KEY:
-        raise RuntimeError(
-            "MISTRAL_API_KEY not set in .env. "
-            "Get a free key at https://console.mistral.ai"
-        )
+SYSTEM_PROMPT = """You are VideoSlack, an expert YouTube content strategist. You help creators understand why videos perform the way they do by analysing two YouTube videos: Video A and Video B.
 
-    llm = ChatMistralAI(
-        api_key=MISTRAL_API_KEY,
-        model=MISTRAL_MODEL,
-        streaming=True,
-        temperature=0.3,       # Low temp for factual accuracy on analytics questions
-        callbacks=[callback_handler],
+You are given (1) each video's real statistics and (2) transcript excerpts retrieved for the current question.
+
+Rules:
+- Ground every claim in the statistics or excerpts below. Never invent numbers, quotes or facts. If the information isn't there, say so plainly.
+- Always say which video (A or B) a point refers to.
+- When you use a transcript excerpt, cite it inline with its tag exactly as written, e.g. [A 0:42] or [B 1:05].
+- Engagement rate = (likes + comments) / views × 100. Use the precomputed values; don't recompute differently.
+- For comparisons, structure the answer as: **Video A**, **Video B**, **Verdict** (or a short table when comparing numbers).
+- Be concise, specific and actionable — creators want things they can do in their next video.
+- Format with Markdown (short paragraphs, bullet lists, bold for key numbers)."""
+
+
+def _fmt_int(n: Optional[int]) -> str:
+    return "unknown" if n is None else f"{n:,}"
+
+
+def describe_video(v: VideoMetadata) -> str:
+    lines = [
+        f"## Video {v.video_id.value}: \"{v.title}\"",
+        f"- Creator: {v.creator} ({_fmt_int(v.follower_count)} subscribers)",
+        f"- URL: {v.url}",
+        f"- Uploaded: {v.upload_date or 'unknown'} · Duration: {format_timestamp(v.duration_seconds)}"
+        f" ({'Short' if v.duration_seconds and v.duration_seconds <= 180 else 'long-form'})",
+        f"- Views: {_fmt_int(v.views)} · Likes: {_fmt_int(v.likes)} · Comments: {_fmt_int(v.comments)}",
+        f"- Engagement rate: {v.engagement_rate}%",
+    ]
+    if v.follower_count:
+        lines.append(f"- Views per subscriber: {v.views / v.follower_count:.2f}")
+    if v.hashtags:
+        lines.append(f"- Tags/hashtags: {', '.join(v.hashtags[:15])}")
+    if v.description:
+        desc = re.sub(r"\s+", " ", v.description)[:300]
+        lines.append(f"- Description (start): {desc}")
+    if v.opening_text:
+        lines.append(f"- Opening / hook (first ~15s of transcript): \"{v.opening_text}\"")
+    lines.append(
+        f"- Transcript language: {v.language or 'unknown'} "
+        f"(from {'auto-transcribed audio' if v.transcript_source == 'whisper' else 'YouTube captions'})"
     )
-
-    retriever = get_retriever(video_id_filter=video_id_filter)
-
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory,
-        return_source_documents=True,
-        output_key="answer",
-        verbose=False,
-        combine_docs_chain_kwargs={
-            "prompt": _build_prompt_template(),
-        },
-    )
-
-    return chain
+    return "\n".join(lines)
 
 
-def _build_prompt_template():
-    """Builds the PromptTemplate with system context injected."""
-    from langchain.prompts import PromptTemplate
-
-    template = (
-        SYSTEM_PROMPT
-        + """
-\nContext from video transcripts:
-{context}
-
-Question: {question}
-
-Answer:"""
-    )
-
-    return PromptTemplate(
-        input_variables=["context", "question"],
-        template=template,
-    )
+def build_stats_block(videos: dict[str, Optional[VideoMetadata]]) -> str:
+    parts = [describe_video(v) for v in videos.values() if v]
+    a, b = videos.get("A"), videos.get("B")
+    if a and b:
+        cmp = compare_engagement(a.model_dump(), b.model_dump())
+        parts.append(f"## Engagement comparison\n{cmp['summary']}")
+    return "\n\n".join(parts) if parts else "(no video statistics available)"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public: async streaming generator
-# ─────────────────────────────────────────────────────────────────────────────
+def build_context_block(sources: list[SourceChunk]) -> str:
+    if not sources:
+        return "(no transcript excerpts matched this question)"
+    ordered = sorted(sources, key=lambda s: (s.video_id.value, s.start_seconds or 0, s.chunk_index))
+    out = []
+    for s in ordered:
+        tag = f"[{s.video_id.value} {s.timestamp}]" if s.timestamp else f"[{s.video_id.value} #{s.chunk_index}]"
+        out.append(f"{tag} {s.text}")
+    return "\n\n".join(out)
 
-async def build_rag_stream(
+
+def build_messages(
     question: str,
     history: list[ChatTurn],
-    video_id_filter: str | None = None,
-) -> AsyncGenerator[str, None]:
-    """
-    Main entry point for the chat router.
+    sources: list[SourceChunk],
+    videos: dict[str, Optional[VideoMetadata]],
+) -> list[BaseMessage]:
+    system = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"# Video statistics\n{build_stats_block(videos)}\n\n"
+        f"# Transcript excerpts retrieved for this question\n{build_context_block(sources)}"
+    )
+    messages: list[BaseMessage] = [SystemMessage(content=system)]
+    for turn in history[-(config.MEMORY_MAX_TURNS * 2):]:
+        cls = HumanMessage if turn.role == "user" else AIMessage
+        if turn.content.strip():
+            messages.append(cls(content=turn.content))
+    messages.append(HumanMessage(content=question))
+    return messages
 
-    Yields SSE-formatted strings:
-      data: {"type": "token",   "content": "Hello"}
-      data: {"type": "sources", "content": [...]}
-      data: {"type": "done"}
 
-    Args:
-        question:         The user's question
-        history:          Full conversation history (client-managed)
-        video_id_filter:  "A", "B", or None (both videos)
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Usage in FastAPI:
-        return StreamingResponse(
-            build_rag_stream(question, history),
-            media_type="text/event-stream"
+def get_llm():
+    if not config.MISTRAL_API_KEY:
+        raise LLMError(
+            "MISTRAL_API_KEY is not set in backend/.env. Get a key at https://console.mistral.ai"
         )
-    """
-    import asyncio
+    from langchain_mistralai import ChatMistralAI
 
-    handler = StreamingCallbackHandler()
-    memory  = _build_memory(history)
-    chain   = _build_chain(memory, handler, video_id_filter)
+    return ChatMistralAI(  # type: ignore[call-arg]  (pydantic aliases confuse Pylance)
+        api_key=config.MISTRAL_API_KEY,
+        model=config.MISTRAL_MODEL,
+        temperature=config.LLM_TEMPERATURE,
+        max_retries=2,
+        timeout=120,
+    )
 
-    # Run the chain in a thread (LangChain sync chains block the event loop)
-    async def _run_chain():
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: chain.invoke({"question": question}),
+
+def _explain_http_error(e: httpx.HTTPStatusError) -> str:
+    code = e.response.status_code
+    if code == 401:
+        return "Mistral rejected the API key (401). Check MISTRAL_API_KEY in backend/.env."
+    if code == 403:
+        return (
+            f"Your Mistral plan doesn't allow model '{config.MISTRAL_MODEL}' (403). "
+            "Set MISTRAL_MODEL in backend/.env to a model your tier allows, e.g. ministral-14b-latest."
         )
+    if code == 429:
+        return (
+            "Mistral rate limit reached — your plan allows only a few requests per minute "
+            f"for '{config.MISTRAL_MODEL}'. Wait about a minute and ask again."
+        )
+    return f"Mistral API error {code}."
 
-    # Start chain execution in background
-    chain_task = asyncio.create_task(_run_chain())
 
-    # Stream tokens as they arrive
-    token_index = 0
-    while not handler.done or token_index < len(handler.tokens):
-        # Yield any new tokens
-        while token_index < len(handler.tokens):
-            token = handler.tokens[token_index]
-            token_index += 1
-            payload = json.dumps({"type": "token", "content": token})
-            yield f"data: {payload}\n\n"
+async def _stream_llm(messages: list[BaseMessage]) -> AsyncGenerator[dict[str, Any], None]:
+    """Streams tokens, retrying on 429 only if nothing has been streamed yet."""
+    llm = get_llm()
+    for attempt in range(config.LLM_MAX_RETRIES + 1):
+        started = False
+        try:
+            async for chunk in llm.astream(messages):
+                text = chunk.content if isinstance(chunk.content, str) else ""
+                if text:
+                    started = True
+                    yield {"type": "token", "content": text}
+            return
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            logger.warning("Mistral HTTP %s (attempt %d): %s", status, attempt + 1, e)
+            if status == 429 and not started and attempt < config.LLM_MAX_RETRIES:
+                delay = RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
+                yield {
+                    "type": "status",
+                    "content": f"Mistral rate limit hit — retrying in {delay}s…",
+                }
+                await asyncio.sleep(delay)
+                continue
+            raise LLMError(_explain_http_error(e)) from e
+        except httpx.TransportError as e:
+            raise LLMError(f"Could not reach Mistral: {e}") from e
 
-        # Brief sleep to avoid busy-waiting
-        if not handler.done:
-            await asyncio.sleep(0.01)
 
-    # Drain any remaining tokens after done flag
-    while token_index < len(handler.tokens):
-        token = handler.tokens[token_index]
-        token_index += 1
-        payload = json.dumps({"type": "token", "content": token})
-        yield f"data: {payload}\n\n"
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Wait for chain to fully complete
-    await chain_task
-
-    # Emit source chunks
-    sources = _docs_to_source_chunks(handler.source_documents)
-    sources_payload = json.dumps({
-        "type": "sources",
-        "content": [s.model_dump() for s in sources],
-    })
-    yield f"data: {sources_payload}\n\n"
-
-    # Terminal event
-    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+async def stream_answer(
+    question: str,
+    history: list[ChatTurn],
+    video_id_filter: Optional[str] = None,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """
+    Yields event dicts:
+      {"type": "status",  "content": "..."}      — optional progress notes
+      {"type": "token",   "content": "..."}      — streamed answer text
+      {"type": "sources", "content": [...]}      — cited chunks
+    Raises LLMError for user-facing LLM problems.
+    """
+    query = build_retrieval_query(question, history)
+    results = await asyncio.to_thread(vector_store.retrieve, query, video_id_filter)
+    sources = to_source_chunks(results)
+    videos = video_store.get_videos()
+    messages = build_messages(question, history, sources, videos)
 
     logger.info(
-        "Stream complete: %d tokens, %d sources",
-        len(handler.tokens), len(sources),
+        "RAG: filter=%s, %d sources, %d history turns, model=%s",
+        video_id_filter, len(sources), len(history), config.MISTRAL_MODEL,
     )
 
+    async for event in _stream_llm(messages):
+        yield event
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public: non-streaming (for testing / fallback)
-# ─────────────────────────────────────────────────────────────────────────────
+    yield {"type": "sources", "content": [s.model_dump(mode="json") for s in sources]}
 
-def run_rag_query(
+
+async def answer(
     question: str,
     history: list[ChatTurn],
-    video_id_filter: str | None = None,
+    video_id_filter: Optional[str] = None,
 ) -> dict[str, Any]:
-    """
-    Synchronous RAG query — returns full answer + sources at once.
-    Use for curl testing. Production uses build_rag_stream().
-    """
-    handler = StreamingCallbackHandler()
-    memory  = _build_memory(history)
-    chain   = _build_chain(memory, handler, video_id_filter)
-
-    result  = chain.invoke({"question": question})
-    answer  = result.get("answer", "")
-    sources = _docs_to_source_chunks(result.get("source_documents", []))
-
-    return {
-        "answer":  answer,
-        "sources": [s.model_dump() for s in sources],
-    }
+    """Non-streaming variant: returns {"answer": str, "sources": [...]}."""
+    parts: list[str] = []
+    sources: list = []
+    async for event in stream_answer(question, history, video_id_filter):
+        if event["type"] == "token":
+            parts.append(event["content"])
+        elif event["type"] == "sources":
+            sources = event["content"]
+    return {"answer": "".join(parts), "sources": sources}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Standalone test — python -m backend.core.rag_chain
-# ─────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import sys
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-
-    # Requires vector store to have data — run vector_store.py test first
-    print("\n── rag_chain standalone test ──")
-    print("NOTE: Run vector_store.py test first to seed ChromaDB with sample data.\n")
-
-    test_questions = [
-        "What makes a good hook in a social media video?",
-        "Compare the engagement strategies in both videos.",
-    ]
-
-    for q in test_questions:
-        print(f"Q: {q}")
-        try:
-            result = run_rag_query(question=q, history=[])
-            print(f"A: {result['answer'][:300]}")
-            print(f"Sources: {len(result['sources'])} chunks")
-            for s in result["sources"]:
-                print(f"  Video {s['video_id']} · chunk {s['chunk_index']}: {s['text'][:60]}...")
-        except Exception as e:
-            print(f"FAILED: {e}", file=sys.stderr)
-        print()
+def sse(event: dict[str, Any]) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"

@@ -1,49 +1,34 @@
+# Install:  pip install -r requirements.txt   (or: uv pip install -r requirements.txt)
+# Also needs ffmpeg on PATH for the Whisper fallback (videos without captions).
+
 # ── Web framework ────────────────────────────────────────────────────────────
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
-python-multipart==0.0.9        # form/file uploads
-
-# ── Validation & settings ────────────────────────────────────────────────────
 pydantic==2.7.1
-pydantic-settings==2.3.1       # BaseSettings for .env loading
 python-dotenv==1.0.1
+httpx==0.27.0
 
-# ── LangChain core + integrations ───────────────────────────────────────────
-langchain==0.2.5
+# ── LangChain + LLM ──────────────────────────────────────────────────────────
 langchain-core==0.2.9
-langchain-community==0.2.5
-langchain-mistralai==0.1.8     # Mistral LLM wrapper
-langchain-chroma==0.1.1        # ChromaDB vectorstore integration
+langchain-text-splitters==0.2.1
+langchain-mistralai==0.1.8        # Mistral chat model (streaming)
+langchain-chroma==0.1.1           # Chroma vector store integration
 
-# ── LLM providers ────────────────────────────────────────────────────────────
-mistralai==0.4.2               # Mistral AI SDK
-openai==1.35.3                 # Optional fallback (GPT-4o-mini)
-
-# ── Embeddings ────────────────────────────────────────────────────────────────
-sentence-transformers==3.0.0   # BGE / MiniLM local embeddings
-torch==2.3.1                   # CPU-only; swap for torch+cu121 for GPU
-transformers==4.41.2           # HuggingFace backbone for sentence-transformers
+# ── Embeddings (local) ───────────────────────────────────────────────────────
+sentence-transformers==3.0.0      # BAAI/bge-small-en-v1.5
+transformers==4.41.2
+torch==2.3.1                      # CPU build is fine
+numpy==1.26.4                     # chromadb 0.5 needs numpy < 2
 
 # ── Vector DB ────────────────────────────────────────────────────────────────
-chromadb==0.5.3                # Local persistent vector store
+chromadb==0.5.3
 
-# ── Transcript extraction ────────────────────────────────────────────────────
-youtube-transcript-api==0.6.2  # YouTube captions (no API key needed)
-yt-dlp==2024.5.27              # Download audio for Instagram / fallback YT
+# ── YouTube ──────────────────────────────────────────────────────────────────
+# These two track YouTube's site changes — keep them current (pip install -U).
+youtube-transcript-api>=1.2.5,<2  # captions (0.6.x no longer works)
+yt-dlp>=2026.10.21                # metadata fallback + audio download
+google-api-python-client==2.134.0 # YouTube Data API v3 (optional key)
+openai-whisper==20231117          # local speech-to-text fallback
 
-# ── Speech-to-text (Instagram Reels fallback) ────────────────────────────────
-openai-whisper==20231117       # Local Whisper model (base/small)
-ffmpeg-python==0.2.0           # Audio conversion wrapper (needs ffmpeg binary)
-
-# ── Metadata scraping ────────────────────────────────────────────────────────
-google-api-python-client==2.134.0  # YouTube Data API v3
-instaloader==4.11              # Instagram public profile & reel metadata
-
-# ── HTTP & async utilities ───────────────────────────────────────────────────
-httpx==0.27.0                  # Async HTTP (used by several LangChain wrappers)
-aiofiles==23.2.1               # Async file I/O
-requests==2.32.3               # Sync HTTP fallback
-
-# ── Text processing ──────────────────────────────────────────────────────────
-tiktoken==0.7.0                # Token counting for chunk size estimation
-numpy==1.26.4                  # Required by sentence-transformers & whisper
+# ── Dev ──────────────────────────────────────────────────────────────────────
+pytest>=8

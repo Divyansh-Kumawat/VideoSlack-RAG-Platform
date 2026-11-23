@@ -1,335 +1,242 @@
 # backend/core/transcript.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Transcript extraction for YouTube and Instagram Reels.
+# Transcript extraction for YouTube videos.
 #
-# YouTube  → youtube-transcript-api (no download, instant, no API key)
-# Instagram → yt-dlp downloads audio → Whisper transcribes locally
+# Strategy:
+#   1. Captions via youtube-transcript-api (fast, no download, no API key).
+#      Preference: manual English → auto English → any manual → any auto.
+#   2. Fallback when no captions exist (common for Shorts): download the audio
+#      with yt-dlp and transcribe it locally with Whisper. Needs ffmpeg on PATH.
 #
-# Both paths return: { "text": str, "language": str }
+# Returns timestamped segments, so retrieved chunks can cite "Video A @ 0:42".
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
-from dotenv import load_dotenv
-load_dotenv()
-import whisper
-import os
+
+import logging
 import re
 import uuid
-import logging
-import tempfile
-from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict, cast
 
-
-import yt_dlp
-from yt_dlp.utils import DownloadError
 from youtube_transcript_api import (
-    YouTubeTranscriptApi,
-    TranscriptsDisabled,
+    CouldNotRetrieveTranscript,
     NoTranscriptFound,
+    TranscriptsDisabled,
     VideoUnavailable,
+    YouTubeTranscriptApi,
 )
-from youtube_transcript_api.formatters import TextFormatter
 
-
-load_dotenv()
+from backend import config
+from backend.models.schemas import extract_youtube_id
 
 logger = logging.getLogger(__name__)
 
-# ── Config from .env ──────────────────────────────────────────────────────────
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "small")
-WHISPER_TEMP_DIR   = Path(os.getenv("WHISPER_TEMP_DIR", "./tmp_audio"))
-WHISPER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-# ── Whisper model — loaded once at module level (expensive) ───────────────────
-_whisper_model: whisper.Whisper | None = None
-
-def _get_whisper_model() -> whisper.Whisper:
-    global _whisper_model
-    if _whisper_model is None:
-        logger.info("Loading Whisper model: %s", WHISPER_MODEL_SIZE)
-        _whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
-    return _whisper_model
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Return type
+# Types
 # ─────────────────────────────────────────────────────────────────────────────
+
+class Segment(TypedDict):
+    text:  str
+    start: float   # seconds from video start
+
 
 class TranscriptResult(TypedDict):
-    text: str        # clean plain-text transcript
-    language: str    # ISO 639-1 language code e.g. "en", "hi", "es"
+    text:     str             # full clean transcript
+    language: str             # ISO 639-1 code, e.g. "en"
+    source:   str             # "captions" | "whisper"
+    segments: list[Segment]   # timestamped pieces of `text`
+
+
+class TranscriptError(RuntimeError):
+    """Raised with a human-readable reason when no transcript can be produced."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_youtube_video_id(url: str) -> str:
-    """
-    Extracts the 11-character video ID from any YouTube URL format:
-      - https://www.youtube.com/watch?v=XXXXXXXXXXX
-      - https://youtu.be/XXXXXXXXXXX
-      - https://youtube.com/shorts/XXXXXXXXXXX
-    """
-    patterns = [
-        r"(?:v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    raise ValueError(f"Could not extract YouTube video ID from URL: {url}")
+_ANNOTATION_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)")   # [Music], (applause)
+_WS_RE         = re.compile(r"\s+")
 
 
-def _clean_transcript_text(text: str) -> str:
-    """
-    Removes filler artifacts left by auto-generated captions:
-    - [Music], [Applause], (inaudible) etc.
-    - Excess whitespace and newlines.
-    """
-    # Remove caption annotations like [Music], [Laughter], (inaudible)
-    text = re.sub(r"\[.*?\]", "", text)
-    text = re.sub(r"\(.*?\)", "", text)
-    # Collapse multiple spaces/newlines into single space
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def clean_text(text: str) -> str:
+    """Removes caption annotations like [Music] / (inaudible) and collapses whitespace."""
+    text = _ANNOTATION_RE.sub(" ", text or "")
+    text = text.replace(">>", " ")
+    return _WS_RE.sub(" ", text).strip()
+
+
+def _build_result(raw_segments: list[tuple[str, float]], language: str, source: str) -> TranscriptResult:
+    segments: list[Segment] = []
+    for text, start in raw_segments:
+        t = clean_text(text)
+        if t:
+            segments.append(Segment(text=t, start=round(float(start), 2)))
+    full = " ".join(s["text"] for s in segments)
+    return TranscriptResult(text=full, language=language, source=source, segments=segments)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# YouTube transcript extraction
+# 1. Captions
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_youtube_transcript(url: str) -> TranscriptResult:
-    """
-    Fetches transcript for a YouTube video using youtube-transcript-api.
-
-    Strategy:
-    1. Try to get a manually created transcript in English.
-    2. Fall back to any manually created transcript (any language).
-    3. Fall back to auto-generated transcript.
-    4. Raise RuntimeError if nothing is available.
-
-    No API key required. No download needed.
-    """
-    video_id = _extract_youtube_video_id(url)
-    logger.info("Fetching YouTube transcript for video_id=%s", video_id)
-
+def _pick_transcript(transcript_list):
+    """Manual English → generated English → any manual → any generated."""
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-    except VideoUnavailable:
-        raise RuntimeError(f"YouTube video is unavailable or private: {url}")
-    except TranscriptsDisabled:
-        raise RuntimeError(f"Transcripts are disabled for this YouTube video: {url}")
-
-    # Priority order: manual EN → any manual → any generated
-    transcript = None
-    language_code = "en"
-
-    try:
-        transcript = transcript_list.find_manually_created_transcript(["en"])
-        language_code = "en"
-        logger.debug("Found manual English transcript")
+        return transcript_list.find_transcript(["en", "en-US", "en-GB", "en-IN"])
     except NoTranscriptFound:
         pass
+    available = list(transcript_list)
+    manual = [t for t in available if not t.is_generated]
+    generated = [t for t in available if t.is_generated]
+    if manual or generated:
+        return (manual or generated)[0]
+    raise NoTranscriptFound(transcript_list.video_id, ["en"], transcript_list)
 
-    if transcript is None:
-        try:
-            # Get any manually created transcript and translate if needed
-            transcript = transcript_list.find_manually_created_transcript(
-                [t.language_code for t in transcript_list]
-            )
-            language_code = transcript.language_code
-            logger.debug("Found manual transcript in language: %s", language_code)
-        except NoTranscriptFound:
-            pass
 
-    if transcript is None:
-        try:
-            # Last resort: auto-generated
-            transcript = transcript_list.find_generated_transcript(
-                [t.language_code for t in transcript_list]
-            )
-            language_code = transcript.language_code
-            logger.debug("Found auto-generated transcript in language: %s", language_code)
-        except NoTranscriptFound:
-            raise RuntimeError(
-                f"No transcript available for YouTube video: {url}. "
-                "The video may have no captions enabled."
-            )
-
-    # Fetch and format
+def get_caption_transcript(youtube_id: str) -> TranscriptResult:
+    api = YouTubeTranscriptApi()
+    transcript_list = api.list(youtube_id)
+    transcript = _pick_transcript(transcript_list)
     fetched = transcript.fetch()
-    formatter = TextFormatter()
-    raw_text = formatter.format_transcript(fetched)
-    clean_text = _clean_transcript_text(raw_text)
-
-    if not clean_text:
-        raise RuntimeError(f"Transcript fetched but was empty after cleaning: {url}")
-
-    logger.info(
-        "YouTube transcript ready: %d characters, language=%s",
-        len(clean_text), language_code
+    result = _build_result(
+        [(s.text, s.start) for s in fetched.snippets],
+        language=transcript.language_code.split("-")[0],
+        source="captions",
     )
-    return TranscriptResult(text=clean_text, language=language_code)
+    logger.info(
+        "Captions for %s: %d segments, %d chars, lang=%s, generated=%s",
+        youtube_id, len(result["segments"]), len(result["text"]),
+        result["language"], transcript.is_generated,
+    )
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Instagram Reels transcript extraction
+# 2. Whisper fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_instagram_transcript(url: str) -> TranscriptResult:
-    """
-    Downloads the audio from an Instagram Reel using yt-dlp,
-    then transcribes it locally using OpenAI Whisper.
+_whisper_model = None
 
-    Steps:
-    1. yt-dlp downloads the reel audio as .mp3 to WHISPER_TEMP_DIR
-    2. Whisper transcribes the .mp3 (model loaded once, reused)
-    3. Temp file is deleted regardless of success/failure
-    4. Returns clean text + detected language
 
-    Requires: ffmpeg on system PATH (for yt-dlp audio conversion)
-    """
-    logger.info("Downloading Instagram Reel audio: %s", url)
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper   # heavy import — only when actually needed
 
-    # Unique filename to avoid collisions in concurrent requests
-    tmp_filename = WHISPER_TEMP_DIR / f"reel_{uuid.uuid4().hex}"
+        logger.info("Loading Whisper model: %s", config.WHISPER_MODEL)
+        _whisper_model = whisper.load_model(config.WHISPER_MODEL)
+    return _whisper_model
 
-    ydl_opts = {
+
+def get_whisper_transcript(url: str) -> TranscriptResult:
+    """Downloads the audio track with yt-dlp and transcribes it with Whisper."""
+    import yt_dlp
+    from yt_dlp.utils import DownloadError
+
+    config.WHISPER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    stem = f"yt_{uuid.uuid4().hex}"
+    ydl_opts: Any = {
         "format": "bestaudio/best",
-        "outtmpl": str(tmp_filename),           # yt-dlp adds extension automatically
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "128",       # 128kbps — sufficient for speech
-            }
-        ],
+        "outtmpl": str(config.WHISPER_TEMP_DIR / f"{stem}.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
-        "cookiefile": None,                      # Add path to cookies.txt if needed for private reels
+        "noprogress": True,
+        "noplaylist": True,
     }
 
-    audio_path = Path(str(tmp_filename) + ".mp3")
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info is None:
-                raise RuntimeError("yt-dlp returned no info for this URL")
+        logger.info("Downloading audio for Whisper: %s", url)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except DownloadError as e:
+            raise TranscriptError(f"Could not download the video's audio: {e}") from e
 
-        if not audio_path.exists():
-            raise RuntimeError(
-                f"yt-dlp did not produce an audio file at {audio_path}. "
-                "Ensure ffmpeg is installed and on PATH."
-            )
+        files = list(config.WHISPER_TEMP_DIR.glob(f"{stem}.*"))
+        if not files:
+            raise TranscriptError("Audio download produced no file.")
 
-        logger.info("Audio downloaded to %s (%.1f KB)", audio_path, audio_path.stat().st_size / 1024)
+        logger.info("Transcribing %s with Whisper (%s)…", files[0].name, config.WHISPER_MODEL)
+        try:
+            result = _get_whisper_model().transcribe(str(files[0]), fp16=False, verbose=None)
+        except FileNotFoundError as e:
+            raise TranscriptError(
+                "Whisper needs ffmpeg installed and on PATH to decode audio."
+            ) from e
 
-        # Transcribe with Whisper
-        model = _get_whisper_model()
-        logger.info("Transcribing with Whisper model=%s ...", WHISPER_MODEL_SIZE)
-
-        result = model.transcribe(
-            str(audio_path),
-            verbose=False,
-            fp16=False,                          # fp16=False for CPU safety; set True on GPU
+        result = cast(dict[str, Any], result)
+        language = result.get("language") or "unknown"
+        if isinstance(language, list):
+            language = language[0] if language else "unknown"
+        transcript = _build_result(
+            [(str(seg["text"]), float(seg["start"])) for seg in result.get("segments", [])],
+            language=str(language),
+            source="whisper",
         )
-
-        raw_text: str = str(result.get("text", ""))
-        # Whisper may return a language as a string or a list; normalize to str
-        _language_raw = result.get("language", "unknown")
-        if isinstance(_language_raw, list):
-            language_code: str = _language_raw[0] if _language_raw else "unknown"
-        else:
-            language_code: str = str(_language_raw)
-
-        clean_text = _clean_transcript_text(raw_text)
-
-        if not clean_text:
-            raise RuntimeError(
-                "Whisper produced an empty transcript. "
-                "The reel may be music-only or have no speech."
-            )
-
-        logger.info(
-            "Instagram transcript ready: %d characters, language=%s",
-            len(clean_text), language_code
-        )
-        return TranscriptResult(text=clean_text, language=language_code)
-
-    except DownloadError as e:
-        raise RuntimeError(
-            f"yt-dlp failed to download the Instagram Reel: {e}. "
-            "The reel may be private, deleted, or geo-restricted."
-        ) from e
-
+        logger.info("Whisper transcript: %d chars, lang=%s", len(transcript["text"]), language)
+        return transcript
     finally:
-        # Always clean up temp audio file
-        if audio_path.exists():
-            audio_path.unlink()
-            logger.debug("Cleaned up temp audio file: %s", audio_path)
+        for f in config.WHISPER_TEMP_DIR.glob(f"{stem}.*"):
+            try:
+                f.unlink()
+            except OSError:
+                logger.warning("Could not delete temp file %s", f)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Unified entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_transcript(url: str, platform: str) -> TranscriptResult:
+def get_transcript(url: str) -> TranscriptResult:
     """
-    Unified dispatcher. Call this from the ingestion pipeline.
-
-    Args:
-        url:      The video URL (YouTube or Instagram)
-        platform: "youtube" or "instagram"
-
-    Returns:
-        TranscriptResult with keys: text (str), language (str)
+    Returns the transcript of a YouTube video.
 
     Raises:
-        ValueError:   Unknown platform
-        RuntimeError: Extraction failed (with human-readable reason)
+        TranscriptError with a human-readable reason if nothing works.
     """
-    platform = platform.lower().strip()
+    youtube_id = extract_youtube_id(url)
+    logger.info("Fetching transcript for %s", youtube_id)
 
-    if platform == "youtube":
-        return get_youtube_transcript(url)
-    elif platform in ("instagram", "instagram_reel"):
-        return get_instagram_transcript(url)
-    else:
-        raise ValueError(
-            f"Unknown platform '{platform}'. Expected 'youtube' or 'instagram'."
+    caption_problem: str
+    try:
+        result = get_caption_transcript(youtube_id)
+        if result["text"]:
+            return result
+        caption_problem = "captions were empty"
+    except VideoUnavailable as e:
+        raise TranscriptError(f"YouTube video {youtube_id} is unavailable or private.") from e
+    except (TranscriptsDisabled, NoTranscriptFound):
+        caption_problem = "the video has no captions"
+    except CouldNotRetrieveTranscript as e:
+        caption_problem = f"captions could not be retrieved ({type(e).__name__})"
+
+    if not config.WHISPER_ENABLED:
+        raise TranscriptError(
+            f"No transcript for {youtube_id}: {caption_problem}. "
+            "Enable WHISPER_ENABLED=true to transcribe the audio instead."
         )
+
+    logger.info("No usable captions for %s (%s) — falling back to Whisper.", youtube_id, caption_problem)
+    result = get_whisper_transcript(url)
+    if not result["text"]:
+        raise TranscriptError(
+            f"No transcript for {youtube_id}: {caption_problem}, and Whisper heard no speech "
+            "(the video may be music-only)."
+        )
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Standalone test — run: python -m backend.core.transcript
+# Standalone test — python -m backend.core.transcript <url>
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-
-    # Quick smoke test with a known public video
-    TEST_YT_URL = "https://youtu.be/T-D1OfcDW1M"
-
-    print("\n── YouTube transcript test ──")
-    try:
-        result = get_youtube_transcript(TEST_YT_URL)
-        print(f"Language : {result['language']}")
-        print(f"Length   : {len(result['text'])} chars")
-        print(f"Preview  : {result['text'][:300]}")
-    except Exception as e:
-        print(f"FAILED: {e}", file=sys.stderr)
-
-    # Uncomment and replace with a real public reel URL to test Instagram
-    # TEST_IG_URL = "https://www.instagram.com/reel/XXXXXXXXXXXX/"
-    # print("\n── Instagram transcript test ──")
-    # try:
-    #     result = get_instagram_transcript(TEST_IG_URL)
-    #     print(f"Language : {result['language']}")
-    #     print(f"Length   : {len(result['text'])} chars")
-    #     print(f"Preview  : {result['text'][:300]}")
-    # except Exception as e:
-    #     print(f"FAILED: {e}", file=sys.stderr)
+    test_url = sys.argv[1] if len(sys.argv) > 1 else "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    r = get_transcript(test_url)
+    print(f"source={r['source']} lang={r['language']} chars={len(r['text'])} segments={len(r['segments'])}")
+    print(r["text"][:300])

@@ -1,96 +1,120 @@
 # backend/routers/ingest.py
 # ─────────────────────────────────────────────────────────────────────────────
-# POST /ingest
-# Both Video A and Video B are YouTube videos.
-# Pipeline: transcript → metadata → engagement → chunk → embed → store
+# POST /ingest        — ingest two YouTube videos (A and B)
+# GET  /ingest/status — chunk counts
+# GET  /videos        — currently ingested videos (restores the UI on reload)
+# DELETE /videos      — wipe everything
+#
+# Pipeline per video: transcript → metadata → engagement → chunk → embed → store
+# Both videos are fetched in parallel, and the store is only modified once BOTH
+# succeed — a failure on Video B never leaves you with half-replaced data.
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
+
 from fastapi import APIRouter, HTTPException
 
+from backend.core import vector_store, video_store
+from backend.core.engagement import compute_engagement_rate_from_metadata
+from backend.core.metadata import get_metadata
+from backend.core.transcript import TranscriptResult, get_transcript
 from backend.models.schemas import (
+    ErrorResponse,
     IngestRequest,
     IngestResponse,
-    VideoMetadata,
     VideoID,
-    ErrorResponse,
-)
-from backend.core.transcript   import get_transcript
-from backend.core.metadata     import get_metadata
-from backend.core.engagement   import compute_engagement_rate_from_metadata
-from backend.core.vector_store import (
-    chunk_transcript,
-    upsert_chunks,
-    clear_video,
-    get_chunk_count,
+    VideoMetadata,
+    VideosResponse,
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/ingest", tags=["ingestion"])
+router = APIRouter(tags=["ingestion"])
+
+HOOK_SECONDS = 15
+
+# One ingestion at a time — two concurrent requests would interleave writes.
+_ingest_lock = asyncio.Lock()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipeline for a single video
-# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class _Fetched:
+    video_id: str
+    url: str
+    meta: dict
+    transcript: TranscriptResult
 
-def _run_single_pipeline(url: str, video_id: str) -> VideoMetadata:
-    """
-    Full ingestion pipeline for one YouTube video.
-    Platform is always 'youtube' — no Instagram logic needed.
-    """
-    logger.info("[%s] Starting pipeline: %s", video_id, url)
 
-    # Step 1 — Transcript
-    logger.info("[%s] Step 1/5: Extracting transcript...", video_id)
-    transcript_result = get_transcript(url=url, platform="youtube")
-    transcript_text   = transcript_result["text"]
-    language          = transcript_result.get("language", "unknown")
-    logger.info("[%s] Transcript: %d chars, lang=%s", video_id, len(transcript_text), language)
+def opening_text(t: TranscriptResult, seconds: float = HOOK_SECONDS, max_chars: int = 400) -> str:
+    """The first ~15 seconds of speech — the video's hook."""
+    segs = t.get("segments") or []
+    if segs:
+        early = [s["text"] for s in segs if s["start"] < seconds] or [segs[0]["text"]]
+        text = " ".join(early)
+    else:
+        text = t["text"][:250]
+    return text[:max_chars].strip()
 
-    # Step 2 — Metadata
-    logger.info("[%s] Step 2/5: Fetching metadata...", video_id)
-    meta = get_metadata(url=url, platform="youtube")
 
-    # Step 3 — Engagement rate
-    logger.info("[%s] Step 3/5: Computing engagement rate...", video_id)
-    engagement_rate = compute_engagement_rate_from_metadata(meta)
+def _fetch(video_id: str, url: str) -> _Fetched:
+    """Network-bound half of the pipeline (no writes)."""
+    logger.info("[%s] Fetching transcript + metadata: %s", video_id, url)
+    transcript = get_transcript(url)
+    meta = get_metadata(url)
+    return _Fetched(video_id=video_id, url=url, meta=meta, transcript=transcript)
 
-    # Step 4 — Clear stale chunks (idempotent re-ingestion)
-    logger.info("[%s] Step 4/5: Clearing old chunks...", video_id)
-    clear_video(video_id)
 
-    # Step 5 — Chunk + embed + store
-    logger.info("[%s] Step 5/5: Chunking and embedding...", video_id)
-    chunks = chunk_transcript(
-        transcript=transcript_text,
-        video_id=video_id,
-        creator=meta["creator"],
-        title=meta["title"],
-        platform="youtube",
-        url=url,
+def _store(f: _Fetched) -> VideoMetadata:
+    """Write half of the pipeline: replace this video's chunks."""
+    m = f.meta
+    vector_store.clear_video(f.video_id)
+    chunks = vector_store.chunk_transcript(
+        transcript=f.transcript["text"],
+        video_id=f.video_id,
+        creator=m["creator"],
+        title=m["title"],
+        youtube_id=m["youtube_id"],
+        url=f.url,
+        segments=f.transcript["segments"],
     )
-    upsert_chunks(chunks)
-    logger.info("[%s] Done: %d chunks stored", video_id, len(chunks))
+    vector_store.upsert_chunks(chunks)
 
     return VideoMetadata(
-        video_id=VideoID(video_id),
-        platform="youtube",
-        url=url,
-        title=meta["title"],
-        creator=meta["creator"],
-        follower_count=meta.get("follower_count"),
-        views=meta["views"],
-        likes=meta["likes"],
-        comments=meta["comments"],
-        engagement_rate=engagement_rate,
-        upload_date=meta["upload_date"],
-        duration_seconds=meta["duration_seconds"],
-        hashtags=meta.get("hashtags", []),
-        thumbnail_url=meta.get("thumbnail_url"),
-        transcript=transcript_text,
-        language=language,
+        video_id=VideoID(f.video_id),
+        youtube_id=m["youtube_id"],
+        url=f.url,
+        title=m["title"],
+        creator=m["creator"],
+        follower_count=m.get("follower_count"),
+        views=m["views"],
+        likes=m["likes"],
+        comments=m["comments"],
+        engagement_rate=compute_engagement_rate_from_metadata(m),
+        upload_date=m["upload_date"],
+        duration_seconds=m["duration_seconds"],
+        hashtags=m.get("hashtags", []),
+        thumbnail_url=m.get("thumbnail_url"),
+        description=m.get("description"),
+        transcript=f.transcript["text"],
+        opening_text=opening_text(f.transcript),
+        transcript_source=f.transcript["source"],
+        language=f.transcript["language"],
+        chunk_count=len(chunks),
+    )
+
+
+def _error(video_id: str, exc: BaseException) -> HTTPException:
+    logger.error("Video %s failed: %s", video_id, exc, exc_info=exc)
+    return HTTPException(
+        status_code=422,
+        detail=ErrorResponse(
+            error="ingestion_failed",
+            detail=f"Video {video_id}: {exc}",
+            video_id=VideoID(video_id),
+        ).model_dump(),
     )
 
 
@@ -98,50 +122,70 @@ def _run_single_pipeline(url: str, video_id: str) -> VideoMetadata:
 # Routes
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.post("", response_model=IngestResponse, summary="Ingest two YouTube videos")
+@router.post("/ingest", response_model=IngestResponse, summary="Ingest two YouTube videos")
 async def ingest_videos(request: IngestRequest) -> IngestResponse:
-    """
-    Runs the full pipeline for both YouTube URLs sequentially.
-    Returns full metadata for both videos ready for the frontend VideoCards.
-    """
+    if _ingest_lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail=ErrorResponse(
+                error="ingestion_in_progress",
+                detail="Another ingestion is already running. Try again when it finishes.",
+            ).model_dump(),
+        )
+    async with _ingest_lock:
+        return await _ingest(request)
+
+
+async def _ingest(request: IngestRequest) -> IngestResponse:
     logger.info("Ingest: A=%s  B=%s", request.youtube_url_a, request.youtube_url_b)
 
-    # Video A
+    results = await asyncio.gather(
+        asyncio.to_thread(_fetch, "A", request.youtube_url_a),
+        asyncio.to_thread(_fetch, "B", request.youtube_url_b),
+        return_exceptions=True,
+    )
+    for vid, res in zip(("A", "B"), results):
+        if isinstance(res, BaseException):
+            raise _error(vid, res)
+
     try:
-        video_a = _run_single_pipeline(url=request.youtube_url_a, video_id="A")
+        video_a = await asyncio.to_thread(_store, results[0])
+        video_b = await asyncio.to_thread(_store, results[1])
     except Exception as e:
-        logger.error("Video A failed: %s", e, exc_info=True)
+        logger.error("Storing chunks failed: %s", e, exc_info=True)
         raise HTTPException(
-            status_code=422,
-            detail=ErrorResponse(error="ingestion_failed", detail=str(e), video_id=VideoID.A).model_dump(),
+            status_code=500,
+            detail=ErrorResponse(error="storage_failed", detail=str(e)).model_dump(),
         )
 
-    # Video B
-    try:
-        video_b = _run_single_pipeline(url=request.youtube_url_b, video_id="B")
-    except Exception as e:
-        logger.error("Video B failed: %s", e, exc_info=True)
-        raise HTTPException(
-            status_code=422,
-            detail=ErrorResponse(error="ingestion_failed", detail=str(e), video_id=VideoID.B).model_dump(),
-        )
-
-    total_chunks = get_chunk_count()
-    logger.info("Ingestion complete. Total chunks: %d", total_chunks)
+    video_store.save_videos([video_a, video_b])
+    total = video_a.chunk_count + video_b.chunk_count
+    logger.info("Ingestion complete: A=%d chunks, B=%d chunks", video_a.chunk_count, video_b.chunk_count)
 
     return IngestResponse(
         video_a=video_a,
         video_b=video_b,
-        chunks_stored=total_chunks,
-        message="Both YouTube videos ingested successfully. You can now ask questions.",
+        chunks_stored=total,
+        message="Both videos ingested. You can now ask questions.",
     )
 
 
-@router.get("/status", summary="Check ingestion status")
+@router.get("/ingest/status", summary="Chunk counts per video")
 async def ingestion_status() -> dict:
-    return {
-        "chunks_video_a": get_chunk_count("A"),
-        "chunks_video_b": get_chunk_count("B"),
-        "total_chunks":   get_chunk_count(),
-        "ready":          get_chunk_count("A") > 0 and get_chunk_count("B") > 0,
-    }
+    a, b = vector_store.get_chunk_count("A"), vector_store.get_chunk_count("B")
+    return {"chunks_video_a": a, "chunks_video_b": b, "total_chunks": a + b, "ready": a > 0 and b > 0}
+
+
+@router.get("/videos", response_model=VideosResponse, summary="Currently ingested videos")
+async def list_videos() -> VideosResponse:
+    videos = video_store.get_videos()
+    a, b = videos["A"], videos["B"]
+    ready = bool(a and b and vector_store.get_chunk_count() > 0)
+    return VideosResponse(video_a=a, video_b=b, ready=ready)
+
+
+@router.delete("/videos", summary="Delete all ingested videos")
+async def delete_videos() -> dict:
+    await asyncio.to_thread(vector_store.clear_all)
+    video_store.clear_videos()
+    return {"status": "cleared"}

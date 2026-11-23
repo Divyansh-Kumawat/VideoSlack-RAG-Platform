@@ -1,326 +1,200 @@
 # backend/core/metadata.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Metadata extraction for YouTube (via YouTube Data API v3)
-# and Instagram (via instaloader).
+# YouTube metadata extraction.
 #
-# Returns a dict that maps directly to VideoMetadata schema.
+# Primary:  YouTube Data API v3 (needs YOUTUBE_API_KEY, ~2 quota units/video).
+# Fallback: yt-dlp page scrape (no key needed) — used when the key is missing
+#           or the API call fails, so ingestion never depends on the key.
+#
+# Returns a dict whose keys map directly onto the VideoMetadata schema.
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
 
-import os
-import re
 import logging
-from datetime import datetime, timezone
+import re
 from typing import Any
 
-import instaloader
-from instaloader.instaloader import Instaloader
-from instaloader.structures import Post, Profile
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from dotenv import load_dotenv
-
-load_dotenv()
+from backend import config
+from backend.models.schemas import extract_youtube_id
 
 logger = logging.getLogger(__name__)
 
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+
+class MetadataError(RuntimeError):
+    """Raised with a human-readable reason when metadata cannot be fetched."""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_youtube_video_id(url: str) -> str:
-    match = re.search(r"(?:v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})", url)
-    if not match:
-        raise ValueError(f"Cannot extract YouTube video ID from: {url}")
-    return match.group(1)
-
-
-def _extract_instagram_shortcode(url: str) -> str:
-    """Extracts shortcode from URLs like /reel/CODE/ or /p/CODE/"""
-    match = re.search(r"/(?:reel|p)/([A-Za-z0-9_-]+)", url)
-    if not match:
-        raise ValueError(f"Cannot extract Instagram shortcode from: {url}")
-    return match.group(1)
-
-
-def _parse_iso8601_duration(duration: str) -> int:
-    """
-    Converts YouTube ISO 8601 duration string to total seconds.
-    e.g. 'PT4M13S' → 253,  'PT1H2M30S' → 3750
-    """
-    pattern = r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?"
-    match = re.match(pattern, duration)
+def parse_iso8601_duration(duration: str) -> int:
+    """'PT4M13S' → 253, 'PT1H2M30S' → 3750, 'P1DT1S' → 86401."""
+    match = re.fullmatch(
+        r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", duration or ""
+    )
     if not match:
         return 0
-    hours   = int(match.group(1) or 0)
-    minutes = int(match.group(2) or 0)
-    seconds = int(match.group(3) or 0)
-    return hours * 3600 + minutes * 60 + seconds
+    d, h, m, s = (int(g or 0) for g in match.groups())
+    return d * 86400 + h * 3600 + m * 60 + s
 
 
-def _extract_hashtags(text: str) -> list[str]:
-    """Returns list of hashtags (without #) found in any text blob."""
-    return re.findall(r"#(\w+)", text or "")
+def extract_hashtags(text: str) -> list[str]:
+    """Hashtags (without '#') found in a text blob, in order, de-duplicated."""
+    seen: dict[str, None] = {}
+    for tag in re.findall(r"#(\w+)", text or ""):
+        seen.setdefault(tag, None)
+    return list(seen)
+
+
+def _merge_tags(*groups: list[str], limit: int = 20) -> list[str]:
+    out: dict[str, None] = {}
+    for group in groups:
+        for tag in group or []:
+            tag = tag.strip().lstrip("#")
+            if tag and tag.lower() not in {t.lower() for t in out}:
+                out[tag] = None
+    return list(out)[:limit]
+
+
+def _best_thumbnail(thumbnails: dict[str, Any]) -> str | None:
+    for key in ("maxres", "standard", "high", "medium", "default"):
+        if thumbnails.get(key, {}).get("url"):
+            return thumbnails[key]["url"]
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# YouTube metadata
+# YouTube Data API v3
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_youtube_metadata(url: str) -> dict[str, Any]:
-    """
-    Fetches video metadata using the YouTube Data API v3.
-
-    Costs ~3 quota units (snippet + statistics + contentDetails).
-    Free tier: 10,000 units/day → supports ~3,333 video lookups/day.
-
-    Returns dict matching VideoMetadata fields (except video_id, platform,
-    transcript — those are added by the ingestion pipeline).
-    """
-    if not YOUTUBE_API_KEY:
-        raise RuntimeError(
-            "YOUTUBE_API_KEY is not set in .env. "
-            "Get a free key at https://console.cloud.google.com"
-        )
-
-    video_id = _extract_youtube_video_id(url)
-    logger.info("Fetching YouTube metadata for video_id=%s", video_id)
+def get_metadata_from_api(youtube_id: str, url: str) -> dict[str, Any]:
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
 
     try:
-        youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
-
-        # Single API call — fetch all three parts at once to save quota
+        youtube = build("youtube", "v3", developerKey=config.YOUTUBE_API_KEY, cache_discovery=False)
         response = (
             youtube.videos()
-            .list(
-                part="snippet,statistics,contentDetails",
-                id=video_id,
-            )
+            .list(part="snippet,statistics,contentDetails", id=youtube_id)
             .execute()
         )
     except HttpError as e:
-        raise RuntimeError(
-            f"YouTube Data API error: {e.reason}. "
-            "Check your API key and quota at console.cloud.google.com."
-        ) from e
+        raise MetadataError(f"YouTube Data API error: {getattr(e, 'reason', e)}") from e
 
     items = response.get("items", [])
     if not items:
-        raise RuntimeError(
-            f"No YouTube video found for ID '{video_id}'. "
-            "The video may be private, deleted, or the ID is wrong."
+        raise MetadataError(
+            f"No YouTube video found for ID '{youtube_id}' — it may be private or deleted."
         )
 
-    item       = items[0]
-    snippet    = item.get("snippet", {})
-    stats      = item.get("statistics", {})
-    content    = item.get("contentDetails", {})
+    item    = items[0]
+    snippet = item.get("snippet", {})
+    stats   = item.get("statistics", {})
+    content = item.get("contentDetails", {})
+    description = snippet.get("description", "")
 
-    # --- Extract fields ---
-    title         = snippet.get("title", "Unknown Title")
-    creator       = snippet.get("channelTitle", "Unknown Creator")
-    upload_date   = snippet.get("publishedAt", "")[:10]   # "2024-03-15T..."  → "2024-03-15"
-    description   = snippet.get("description", "")
-    tags          = snippet.get("tags", [])
-    thumbnail_url = (
-        snippet.get("thumbnails", {})
-        .get("maxres", snippet.get("thumbnails", {}).get("high", {}))
-        .get("url")
-    )
-
-    views     = int(stats.get("viewCount",    0))
-    likes     = int(stats.get("likeCount",    0))
-    comments  = int(stats.get("commentCount", 0))
-
-    duration_seconds = _parse_iso8601_duration(content.get("duration", "PT0S"))
-
-    # Combine API tags + hashtags from description
-    hashtags = list(set(tags + _extract_hashtags(description)))
-
-    # Fetch subscriber count (separate channels call)
-    channel_id = snippet.get("channelId", "")
     follower_count = None
+    channel_id = snippet.get("channelId")
     if channel_id:
         try:
-            ch_response = (
-                youtube.channels()
-                .list(part="statistics", id=channel_id)
-                .execute()
-            )
-            ch_items = ch_response.get("items", [])
-            if ch_items:
-                follower_count = int(
-                    ch_items[0].get("statistics", {}).get("subscriberCount", 0)
-                )
+            ch = youtube.channels().list(part="statistics", id=channel_id).execute()
+            ch_items = ch.get("items", [])
+            if ch_items and not ch_items[0].get("statistics", {}).get("hiddenSubscriberCount"):
+                follower_count = int(ch_items[0]["statistics"].get("subscriberCount", 0))
         except HttpError:
             logger.warning("Could not fetch subscriber count for channel %s", channel_id)
 
-    logger.info(
-        "YouTube metadata: title='%s', views=%d, likes=%d, comments=%d",
-        title, views, likes, comments,
-    )
-
     return {
+        "youtube_id":       youtube_id,
         "url":              url,
-        "title":            title,
-        "creator":          creator,
+        "title":            snippet.get("title", "Untitled video"),
+        "creator":          snippet.get("channelTitle", "Unknown creator"),
         "follower_count":   follower_count,
-        "views":            views,
-        "likes":            likes,
-        "comments":         comments,
-        "upload_date":      upload_date,
-        "duration_seconds": duration_seconds,
-        "hashtags":         hashtags,
-        "thumbnail_url":    thumbnail_url,
-        "platform":         "youtube",
+        "views":            int(stats.get("viewCount", 0)),
+        "likes":            int(stats.get("likeCount", 0)),       # 0 if likes are hidden
+        "comments":         int(stats.get("commentCount", 0)),    # 0 if comments are off
+        "upload_date":      (snippet.get("publishedAt") or "")[:10],
+        "duration_seconds": parse_iso8601_duration(content.get("duration", "")),
+        "hashtags":         _merge_tags(extract_hashtags(description), snippet.get("tags", [])),
+        "thumbnail_url":    _best_thumbnail(snippet.get("thumbnails", {})),
+        "description":      description[:2000],
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Instagram metadata
+# yt-dlp fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_instagram_metadata(url: str) -> dict[str, Any]:
-    """
-    Scrapes Instagram Reel metadata using instaloader.
+def get_metadata_from_ytdlp(youtube_id: str, url: str) -> dict[str, Any]:
+    import yt_dlp
+    from yt_dlp.utils import DownloadError
 
-    Works anonymously for public profiles. Set INSTAGRAM_USERNAME +
-    INSTAGRAM_PASSWORD in .env to increase rate limits.
+    opts: Any = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={youtube_id}", download=False)
+    except DownloadError as e:
+        raise MetadataError(f"Could not read video page: {e}") from e
+    if not info:
+        raise MetadataError("yt-dlp returned no information for this video.")
 
-    Note: Instagram does not expose likes publicly via API; instaloader
-    scrapes what is visible on the public page. Likes may show as 0
-    if Instagram hides them (they started hiding counts in 2019).
-    """
-    shortcode = _extract_instagram_shortcode(url)
-    logger.info("Fetching Instagram metadata for shortcode=%s", shortcode)
+    raw_date = info.get("upload_date") or ""          # "20240315"
+    upload_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}" if len(raw_date) == 8 else ""
+    description = info.get("description") or ""
 
-    username = os.getenv("INSTAGRAM_USERNAME", "").strip()
-    password = os.getenv("INSTAGRAM_PASSWORD", "").strip()
+    return {
+        "youtube_id":       youtube_id,
+        "url":              url,
+        "title":            info.get("title") or "Untitled video",
+        "creator":          info.get("channel") or info.get("uploader") or "Unknown creator",
+        "follower_count":   info.get("channel_follower_count"),
+        "views":            int(info.get("view_count") or 0),
+        "likes":            int(info.get("like_count") or 0),
+        "comments":         int(info.get("comment_count") or 0),
+        "upload_date":      upload_date,
+        "duration_seconds": int(info.get("duration") or 0),
+        "hashtags":         _merge_tags(extract_hashtags(description), info.get("tags") or []),
+        "thumbnail_url":    info.get("thumbnail"),
+        "description":      description[:2000],
+    }
 
-    L = instaloader.Instaloader(
-        quiet=True,
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-    )
 
-    # Login if credentials provided (better rate limits)
-    if username and password:
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_metadata(url: str) -> dict[str, Any]:
+    youtube_id = extract_youtube_id(url)
+
+    if config.YOUTUBE_API_KEY:
         try:
-            L.login(username, password)
-            logger.debug("Logged into Instagram as %s", username)
-        except instaloader.exceptions.BadCredentialsException:
-            logger.warning("Instagram login failed — proceeding anonymously")
-        except Exception as e:
-            logger.warning("Instagram login error: %s — proceeding anonymously", e)
-
-    try:
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
-    except instaloader.exceptions.InstaloaderException as e:
-        raise RuntimeError(
-            f"Could not fetch Instagram Reel '{shortcode}': {e}. "
-            "The post may be private, deleted, or geo-restricted."
-        ) from e
-    except Exception as e:
-        raise RuntimeError(f"Unexpected error fetching Instagram post: {e}") from e
-
-    # --- Extract fields ---
-    title       = (post.caption or "")[:200].strip()   # Use caption as title (truncated)
-    creator     = post.owner_username
-    views       = post.video_view_count or 0
-    likes       = post.likes or 0
-    comments    = post.comments or 0
-    upload_date = post.date_utc.strftime("%Y-%m-%d") if post.date_utc else ""
-    hashtags    = _extract_hashtags(post.caption or "")
-
-    # Duration: instaloader exposes it for videos/reels
-    duration_seconds = int(getattr(post, "video_duration", 0) or 0)
-
-    # Thumbnail
-    thumbnail_url = post.url   # direct CDN URL of the video thumbnail
-
-    # Follower count from owner profile
-    follower_count = None
-    try:
-        profile = instaloader.Profile.from_username(L.context, creator)
-        follower_count = profile.followers
-    except Exception as e:
-        logger.warning("Could not fetch follower count for @%s: %s", creator, e)
-
-    logger.info(
-        "Instagram metadata: creator=@%s, views=%d, likes=%d, comments=%d",
-        creator, views, likes, comments,
-    )
-
-    return {
-        "url":              url,
-        "title":            title or f"Reel by @{creator}",
-        "creator":          f"@{creator}",
-        "follower_count":   follower_count,
-        "views":            views,
-        "likes":            likes,
-        "comments":         comments,
-        "upload_date":      upload_date,
-        "duration_seconds": duration_seconds,
-        "hashtags":         hashtags,
-        "thumbnail_url":    thumbnail_url,
-        "platform":         "instagram",
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Unified dispatcher
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_metadata(url: str, platform: str) -> dict[str, Any]:
-    """
-    Unified entry point for the ingestion pipeline.
-
-    Args:
-        url:      Video URL
-        platform: "youtube" or "instagram"
-
-    Returns:
-        Dict with all metadata fields (maps to VideoMetadata schema).
-    """
-    platform = platform.lower().strip()
-    if platform == "youtube":
-        return get_youtube_metadata(url)
-    elif platform in ("instagram", "instagram_reel"):
-        return get_instagram_metadata(url)
+            meta = get_metadata_from_api(youtube_id, url)
+            logger.info("Metadata via YouTube API: '%s' views=%d", meta["title"], meta["views"])
+            return meta
+        except MetadataError as e:
+            if "No YouTube video found" in str(e):
+                raise
+            logger.warning("YouTube API failed (%s) — falling back to yt-dlp.", e)
     else:
-        raise ValueError(f"Unknown platform: '{platform}'")
+        logger.info("YOUTUBE_API_KEY not set — using yt-dlp for metadata.")
+
+    meta = get_metadata_from_ytdlp(youtube_id, url)
+    logger.info("Metadata via yt-dlp: '%s' views=%d", meta["title"], meta["views"])
+    return meta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Standalone test — python -m backend.core.metadata
+# Standalone test — python -m backend.core.metadata <url>
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import json
     import sys
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-
-    TEST_YT_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    print("\n── YouTube metadata test ──")
-    try:
-        meta = get_youtube_metadata(TEST_YT_URL)
-        meta_display = {k: v for k, v in meta.items() if k != "thumbnail_url"}
-        print(json.dumps(meta_display, indent=2))
-    except Exception as e:
-        print(f"FAILED: {e}", file=sys.stderr)
-
-    # Uncomment to test Instagram:
-    # TEST_IG_URL = "https://www.instagram.com/reel/XXXXXXXXXXXX/"
-    # print("\n── Instagram metadata test ──")
-    # try:
-    #     meta = get_instagram_metadata(TEST_IG_URL)
-    #     print(json.dumps(meta, indent=2))
-    # except Exception as e:
-    #     print(f"FAILED: {e}", file=sys.stderr)
+    test_url = sys.argv[1] if len(sys.argv) > 1 else "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    m = get_metadata(test_url)
+    m.pop("description", None)
+    print(json.dumps(m, indent=2))

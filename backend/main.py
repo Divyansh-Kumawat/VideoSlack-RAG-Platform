@@ -2,205 +2,131 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # FastAPI application entrypoint.
 #
-# Startup sequence:
-#   1. Load .env
-#   2. Pre-load BGE embedding model (so first request isn't slow)
-#   3. Initialise ChromaDB client
-#   4. Mount routers
+# Startup: load config → pre-load the embedding model → open ChromaDB → mount routers.
 #
-# Run: uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+# Run from the repository root:
+#   uvicorn backend.main:app --reload --reload-dir backend --port 8000
+# or:
+#   python -m backend.main
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
 
-import os
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
 
-load_dotenv()
+from backend import config
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
-LOG_LEVEL = logging.DEBUG if os.getenv("ENVIRONMENT", "development") == "development" else logging.INFO
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=logging.DEBUG if config.ENVIRONMENT == "development" else logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+# Third-party libraries are very chatty at DEBUG.
+for noisy in ("httpx", "httpcore", "urllib3", "chromadb", "sentence_transformers",
+              "filelock", "multipart", "watchfiles", "asyncio", "googleapiclient"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+# chromadb 0.5.x logs a harmless posthog version-mismatch error on every call.
+logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-API_HOST     = os.getenv("API_HOST", "0.0.0.0")
-API_PORT     = int(os.getenv("API_PORT", 8000))
-ENVIRONMENT  = os.getenv("ENVIRONMENT", "development")
-CORS_ORIGINS = [
-    o.strip()
-    for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
-    if o.strip()
-]
+logger = logging.getLogger("backend")
 
+APP_NAME = "VideoSlack API"
+APP_VERSION = "1.0.0"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Lifespan — runs on startup and shutdown
-# ─────────────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Startup: pre-warm expensive singletons so the first request isn't slow.
-    - BGE embedding model (~90MB, takes 2-4s to load)
-    - ChromaDB client (opens the persistent directory)
+    from backend.core import vector_store
+    from backend.core.embedder import get_model
 
-    Shutdown: nothing to clean up (ChromaDB flushes automatically).
-    """
-    logger.info("=" * 60)
-    logger.info("VideoIQ API starting up (env=%s)", ENVIRONMENT)
-    logger.info("=" * 60)
+    logger.info("%s starting (env=%s, model=%s)", APP_NAME, config.ENVIRONMENT, config.MISTRAL_MODEL)
+    logger.info("Loading embedding model %s (first run downloads it)…", config.EMBEDDING_MODEL)
+    await asyncio.to_thread(get_model)
+    vector_store.get_vectorstore()
+    logger.info("ChromaDB ready at %s: %d chunks stored.",
+                config.CHROMA_PERSIST_DIR, vector_store.get_chunk_count())
+    if not config.MISTRAL_API_KEY:
+        logger.warning("MISTRAL_API_KEY is not set — chat will fail until it is.")
+    logger.info("Ready. Docs at http://localhost:%d/docs", config.API_PORT)
+    yield
+    logger.info("%s shutting down.", APP_NAME)
 
-    # Pre-load embedding model
-    from backend.core.embedder import _get_local_model, EMBEDDING_PROVIDER
-    if EMBEDDING_PROVIDER == "local":
-        logger.info("Pre-loading BGE embedding model...")
-        _get_local_model()
-        logger.info("Embedding model ready.")
-    else:
-        logger.info("Using OpenAI embeddings (no pre-load needed).")
-
-    # Initialise ChromaDB (opens the persistent directory)
-    from backend.core.vector_store import get_vectorstore, get_chunk_count
-    get_vectorstore()
-    total = get_chunk_count()
-    logger.info("ChromaDB ready. Chunks in store: %d", total)
-
-    logger.info("VideoIQ API ready. Listening on %s:%d", API_HOST, API_PORT)
-    logger.info("Docs: http://%s:%d/docs", API_HOST, API_PORT)
-    logger.info("=" * 60)
-
-    yield   # Application runs here
-
-    # Shutdown
-    logger.info("VideoIQ API shutting down.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FastAPI app
-# ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="VideoIQ API",
+    title=APP_NAME,
     description=(
-        "Full-stack RAG chatbot for social media video analysis. "
-        "Ingests YouTube + Instagram Reels, embeds transcripts, "
-        "and answers creator questions via streaming LangChain RAG."
+        "RAG chatbot that ingests two YouTube videos (transcripts + stats) and "
+        "answers creator questions about them with streamed, cited answers."
     ),
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Middleware
-# ─────────────────────────────────────────────────────────────────────────────
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=config.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],    # Needed for SSE streams in some browsers
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Global exception handler
-# ─────────────────────────────────────────────────────────────────────────────
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """
-    Catches any unhandled exception and returns a consistent JSON error
-    instead of a raw 500 Internal Server Error.
-    """
-    logger.error("Unhandled exception on %s %s: %s", request.method, request.url, exc, exc_info=True)
+    logger.error("Unhandled exception on %s %s: %s", request.method, request.url.path, exc, exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={
-            "error":  "internal_server_error",
-            "detail": str(exc),
-        },
+        content={"detail": {"error": "internal_server_error", "detail": str(exc)}},
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Routers
-# ─────────────────────────────────────────────────────────────────────────────
-
-from backend.routers.ingest import router as ingest_router
-from backend.routers.chat   import router as chat_router
+from backend.routers.chat import router as chat_router      # noqa: E402
+from backend.routers.ingest import router as ingest_router  # noqa: E402
 
 app.include_router(ingest_router)
 app.include_router(chat_router)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Root & health endpoints
-# ─────────────────────────────────────────────────────────────────────────────
-
 @app.get("/", tags=["health"])
 async def root():
-    return {
-        "service": "VideoIQ API",
-        "version": "1.0.0",
-        "status":  "running",
-        "docs":    "/docs",
-    }
+    return {"service": APP_NAME, "version": APP_VERSION, "status": "running", "docs": "/docs"}
 
 
 @app.get("/health", tags=["health"])
 async def health():
-    """
-    Full health check — confirms embedding model, ChromaDB, and env vars are ready.
-    Used by Docker healthcheck and deployment platforms (Render, Railway).
-    """
-    from backend.core.vector_store import get_chunk_count
-    from backend.core.embedder import EMBEDDING_PROVIDER, EMBEDDING_MODEL
+    from backend.core import vector_store
 
     issues: list[str] = []
-
-    if not os.getenv("MISTRAL_API_KEY"):
-        issues.append("MISTRAL_API_KEY not set")
-    if not os.getenv("YOUTUBE_API_KEY"):
-        issues.append("YOUTUBE_API_KEY not set")
-
-    total_chunks = get_chunk_count()
+    if not config.MISTRAL_API_KEY:
+        issues.append("MISTRAL_API_KEY not set — chat is unavailable")
+    notes: list[str] = []
+    if not config.YOUTUBE_API_KEY:
+        notes.append("YOUTUBE_API_KEY not set — using yt-dlp for metadata")
 
     return {
-        "status":             "ok" if not issues else "degraded",
-        "issues":             issues,
-        "embedding_provider": EMBEDDING_PROVIDER,
-        "embedding_model":    EMBEDDING_MODEL,
-        "chunks_in_store":    total_chunks,
-        "environment":        ENVIRONMENT,
+        "status":          "ok" if not issues else "degraded",
+        "issues":          issues,
+        "notes":           notes,
+        "llm_model":       config.MISTRAL_MODEL,
+        "embedding_model": config.EMBEDDING_MODEL,
+        "chunks_in_store": vector_store.get_chunk_count(),
+        "environment":     config.ENVIRONMENT,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dev runner — python backend/main.py
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         "backend.main:app",
-        host=API_HOST,
-        port=API_PORT,
-        reload=ENVIRONMENT == "development",
-        log_level="info",
+        host=config.API_HOST,
+        port=config.API_PORT,
+        reload=config.ENVIRONMENT == "development",
+        reload_dirs=["backend"],
     )
