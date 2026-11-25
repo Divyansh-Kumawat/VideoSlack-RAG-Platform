@@ -6,7 +6,7 @@ VideoSlack pulls each video's transcript and stats (views, likes, comments, subs
 
 Built with FastAPI, LangChain, ChromaDB, local BGE embeddings, Mistral, and Next.js.
 
-## Features
+## Feature
 
 - **Two-video comparison.** Video A and Video B are ingested together. Shows side-by-side cards, a head-to-head metrics panel, and the opening "hook" of each video.
 - **Transcripts that just work.** Uses YouTube captions first. When a video has none (common for Shorts), it downloads the audio and transcribes it locally with Whisper.
